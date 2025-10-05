@@ -30,6 +30,7 @@ if (!JWT_SECRET) {
 /* ===================== Express ===================== */
 const app = express();
 app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" })); // <— added
 app.use(cookieParser());
 app.use(
   cors({
@@ -321,9 +322,142 @@ app.post("/api/properties", authGuard, upload.array("images", 10), async (req, r
 });
 
 app.get("/api/properties/:id", async (req, res) => {
-  const item = await Property.findById(req.params.id).lean();
+  const item = await Property.findById(req.params.id)
+    .populate("owner", "_id name email")
+    .lean();
   if (!item) return res.status(404).json({ error: "Not found" });
   res.json({ property: item });
+});
+
+/* ===== UPDATE property (robust coercion & fresh return) ===== */
+app.put("/api/properties/:id", authGuard, upload.array("images", 10), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const prop = await Property.findById(id);
+    if (!prop) return res.status(404).json({ error: "Property not found" });
+
+    if (String(prop.owner) !== String(req.user._id)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const b = req.body || {};
+    const getNum = (x) => (x === "" || x == null ? undefined : Number(x));
+    const getStr = (x) => (x == null ? undefined : String(x));
+
+    // Normalize removePublicIds
+    let toRemoveIds = [];
+    const { removePublicIds } = b;
+    if (Array.isArray(removePublicIds)) {
+      toRemoveIds = removePublicIds;
+    } else if (typeof removePublicIds === "string" && removePublicIds.trim()) {
+      try {
+        const parsed = JSON.parse(removePublicIds);
+        if (Array.isArray(parsed)) toRemoveIds = parsed;
+      } catch {}
+    }
+
+    // Remove selected images (and destroy in Cloudinary)
+    if (toRemoveIds.length) {
+      const toRemove = new Set(toRemoveIds.map(String));
+      const keep = [];
+      for (const img of prop.images || []) {
+        if (toRemove.has(String(img.publicId))) {
+          try { await cloudinary.uploader.destroy(img.publicId); } catch {}
+        } else {
+          keep.push(img);
+        }
+      }
+      prop.images = keep;
+    }
+
+    // Upload new images
+    for (const f of (req.files || [])) {
+      const uploaded = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          { folder: `realestate/${req.user._id}`, resource_type: "image" },
+          (err, data) => (err ? reject(err) : resolve(data))
+        );
+        stream.end(f.buffer);
+      });
+      prop.images.push({ url: uploaded.secure_url, publicId: uploaded.public_id });
+    }
+
+    // Scalars
+    const title = getStr(b.title);
+    const description = getStr(b.description);
+    const price = getNum(b.price);
+    const capitalValue = getNum(b.capitalValue);
+    const bathrooms = getNum(b.bathrooms);
+    const rooms = getNum(b.rooms);
+    const parking = getNum(b.parking);
+
+    if (title !== undefined) prop.title = title.trim();
+    if (description !== undefined) prop.description = description; // allow ""
+    if (price !== undefined) prop.price = isNaN(price) ? prop.price : price;
+    if (capitalValue !== undefined) prop.capitalValue = isNaN(capitalValue) ? prop.capitalValue : capitalValue;
+    if (bathrooms !== undefined) prop.bathrooms = isNaN(bathrooms) ? prop.bathrooms : bathrooms;
+    if (rooms !== undefined) prop.rooms = isNaN(rooms) ? prop.rooms : rooms;
+    if (parking !== undefined) prop.parking = isNaN(parking) ? prop.parking : parking;
+
+    // Address
+    const line1 = getStr(b.line1);
+    const city = getStr(b.city);
+    const country = getStr(b.country);
+    if (line1 !== undefined || city !== undefined || country !== undefined) {
+      prop.address = {
+        line1: line1 !== undefined ? line1 : prop.address?.line1,
+        city: city !== undefined ? city : prop.address?.city,
+        country: country !== undefined ? country : prop.address?.country,
+      };
+    }
+
+    // Location
+    const lat = getNum(b.lat);
+    const lng = getNum(b.lng);
+    if (lat !== undefined || lng !== undefined) {
+      prop.location = {
+        lat: lat !== undefined && !isNaN(lat) ? lat : prop.location?.lat,
+        lng: lng !== undefined && !isNaN(lng) ? lng : prop.location?.lng,
+        formatted: prop.location?.formatted,
+      };
+    }
+
+    await prop.save();
+
+    // Return freshly-hydrated doc to avoid serialization oddities
+    const fresh = await Property.findById(id).populate("owner", "_id name email").lean();
+    res.json({ property: fresh });
+  } catch (e) {
+    console.error("Update property error:", e);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ===== DELETE property ===== */
+app.delete("/api/properties/:id", authGuard, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const prop = await Property.findById(id);
+    if (!prop) return res.status(404).json({ error: "Property not found" });
+
+    if (String(prop.owner) !== String(req.user._id)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    // Clean up bookings
+    await Booking.deleteMany({ property: id });
+
+    // Delete images from Cloudinary
+    for (const img of prop.images || []) {
+      try { await cloudinary.uploader.destroy(img.publicId); } catch {}
+    }
+
+    await prop.deleteOne();
+    res.json({ message: "Deleted" });
+  } catch (e) {
+    console.error("Delete property error:", e);
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 /* ===================== Booking routes ===================== */
@@ -360,7 +494,7 @@ app.post("/api/properties/:id/bookings", authGuard, async (req, res) => {
 
     const property = await Property.findById(id);
     if (!property) return res.status(404).json({ error: "Property not found" });
-    if (String(property.owner) === req.user._id) {
+    if (String(property.owner) === String(req.user._id)) {
       return res.status(400).json({ error: "You cannot book your own property" });
     }
 
@@ -376,22 +510,6 @@ app.post("/api/properties/:id/bookings", authGuard, async (req, res) => {
     res.status(201).json({ booking: created });
   } catch (e) {
     console.error("Create booking error:", e);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.get("/api/bookings", authGuard, async (req, res) => {
-  try {
-    const now = new Date();
-    const items = await Booking.find({ guest: req.user._id })
-      .populate("property", "title address images location")
-      .sort({ start: 1 })
-      .lean();
-
-    const upcoming = items.filter((b) => new Date(b.end) >= now);
-    const past = items.filter((b) => new Date(b.end) < now);
-    res.json({ upcoming, past });
-  } catch {
     res.status(500).json({ error: "Server error" });
   }
 });
